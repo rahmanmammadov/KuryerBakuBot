@@ -1,0 +1,13 @@
+{
+  "ConnectionStrings": {
+    "DefaultConnection": "Data Source=bot.db"
+  },
+  "BotSettings": {
+    "BotToken": "YOUR_TELEGRAM_BOT_TOKEN_HERE",
+    "TargetGroupId": -1001234567890
+  },
+  "ModerationSettings": {
+    "MaxMediaAllowed": 2,
+    "WindowSeconds": 60
+  }
+}

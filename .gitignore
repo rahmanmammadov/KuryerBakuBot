@@ -1,0 +1,12 @@
+# .NET compilation folders
+bin/
+obj/
+
+# Local SQLite databases
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+
+# Secret configuration settings
+appsettings.json
