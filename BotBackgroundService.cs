@@ -293,7 +293,7 @@ namespace KuryerBakuBot
 
             // Azerbaijani Warning Message
             string warningText = $"⚠️ *Hörmətli* {usernameFormatted}\n\n" +
-                                 $"Qrup qaydalarına əsasən, *{windowSeconds} saniyə* ərzində maksimum *{maxMediaAllowed} media* (şəkil və ya video) göndərə bilərsiniz.\n\n" +
+                                 $"Qrup qaydalarına əsasən, maksimum *{maxMediaAllowed} media* (şəkil və ya video) göndərə bilərsiniz.\n\n" +
                                  $"Qaydanı pozan media faylları avtomatik silinir.";
 
             try
