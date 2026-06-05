@@ -8,6 +8,7 @@
   },
   "ModerationSettings": {
     "MaxMediaAllowed": 2,
-    "WindowSeconds": 60
+    "WindowSeconds": 60,
+    "WarningDeleteAfterSeconds": 300
   }
 }

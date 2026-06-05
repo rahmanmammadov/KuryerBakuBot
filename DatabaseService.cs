@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Generic;
 using System.IO;
 using System.Threading;
 using System.Threading.Tasks;
@@ -8,31 +9,31 @@ using Microsoft.Extensions.Logging;
 
 namespace KuryerBakuBot
 {
-    // This model holds the result of our rate-limiting checks
     public class ModerationResult
     {
         public bool IsAllowed { get; set; }
         public bool ShouldWarn { get; set; }
     }
 
+    public class PendingDeletion
+    {
+        public long ChatId { get; set; }
+        public int MessageId { get; set; }
+    }
+
     public class DatabaseService
     {
         private readonly string _connectionString;
         private readonly ILogger<DatabaseService> _logger;
-        
-        // This lock ensures only one thread writes to SQLite at a time, preventing database locks
         private readonly SemaphoreSlim _dbLock = new(1, 1);
 
         public DatabaseService(IConfiguration configuration, ILogger<DatabaseService> logger)
         {
             _logger = logger;
-            
-            // We get the connection string from appsettings.json, or default to a local bot.db file
             string? configConnection = configuration.GetConnectionString("DefaultConnection");
             _connectionString = configConnection ?? "Data Source=bot.db";
         }
 
-        // Creates the database tables if they do not exist
         public async Task InitializeAsync()
         {
             await _dbLock.WaitAsync();
@@ -41,7 +42,8 @@ namespace KuryerBakuBot
                 using var connection = new SqliteConnection(_connectionString);
                 await connection.OpenAsync();
 
-                string createTableSql = @"
+                // Table 1: User Windows
+                string createUserWindowsTableSql = @"
                     CREATE TABLE IF NOT EXISTS UserWindows (
                         UserId INTEGER NOT NULL,
                         ChatId INTEGER NOT NULL,
@@ -51,14 +53,26 @@ namespace KuryerBakuBot
                         PRIMARY KEY (UserId, ChatId)
                     );";
 
-                using var command = new SqliteCommand(createTableSql, connection);
-                await command.ExecuteNonQueryAsync();
+                using var command1 = new SqliteCommand(createUserWindowsTableSql, connection);
+                await command1.ExecuteNonQueryAsync();
+
+                // Table 2: Pending Deletions
+                string createPendingDeletionsTableSql = @"
+                    CREATE TABLE IF NOT EXISTS PendingDeletions (
+                        ChatId INTEGER NOT NULL,
+                        MessageId INTEGER NOT NULL,
+                        DeleteAt TEXT NOT NULL,
+                        PRIMARY KEY (ChatId, MessageId)
+                    );";
+
+                using var command2 = new SqliteCommand(createPendingDeletionsTableSql, connection);
+                await command2.ExecuteNonQueryAsync();
                 
-                _logger.LogInformation("SQLite Database initialized successfully.");
+                _logger.LogInformation("SQLite Database tables initialized successfully.");
             }
             catch (Exception ex)
             {
-                _logger.LogError(ex, "Error occurred while initializing the database.");
+                _logger.LogError(ex, "Error occurred while initializing database tables.");
                 throw;
             }
             finally
@@ -67,7 +81,6 @@ namespace KuryerBakuBot
             }
         }
 
-        // Processes an incoming media message. It automatically handles window expiration and increments counts.
         public async Task<ModerationResult> ProcessMediaMessageAsync(long userId, long chatId, int windowSeconds, int maxMediaAllowed)
         {
             await _dbLock.WaitAsync();
@@ -77,9 +90,8 @@ namespace KuryerBakuBot
                 await connection.OpenAsync();
 
                 DateTime now = DateTime.UtcNow;
-                string nowString = now.ToString("o"); // ISO 8601 string format (safe for database storage)
+                string nowString = now.ToString("o");
 
-                // 1. Fetch the user's current window state
                 string selectSql = "SELECT WindowStart, MediaCount, HasWarned FROM UserWindows WHERE UserId = @UserId AND ChatId = @ChatId";
                 using var selectCommand = new SqliteCommand(selectSql, connection);
                 selectCommand.Parameters.AddWithValue("@UserId", userId);
@@ -95,19 +107,16 @@ namespace KuryerBakuBot
                     if (await reader.ReadAsync())
                     {
                         recordExists = true;
-                        // CRITICAL FIX: We force C# to parse the DB string into UTC format strictly
                         windowStart = DateTime.Parse(reader.GetString(0)).ToUniversalTime();
                         mediaCount = reader.GetInt32(1);
                         hasWarned = reader.GetInt32(2);
                     }
                 }
 
-                // 2. Check if the active window has expired
                 bool isExpired = !recordExists || (now - windowStart).TotalSeconds >= windowSeconds;
 
                 if (isExpired)
                 {
-                    // The window is expired or doesn't exist yet. We reset the counter and start a new window.
                     mediaCount = 1;
                     hasWarned = 0;
                     windowStart = now;
@@ -129,7 +138,6 @@ namespace KuryerBakuBot
                 }
                 else
                 {
-                    // The window is still active. Increment the media count.
                     mediaCount++;
                     bool shouldWarn = false;
                     bool isAllowed = true;
@@ -137,12 +145,10 @@ namespace KuryerBakuBot
                     if (mediaCount > maxMediaAllowed)
                     {
                         isAllowed = false;
-                        
-                        // We only warn once per active window.
                         if (hasWarned == 0)
                         {
                             shouldWarn = true;
-                            hasWarned = 1; // Mark warning as sent
+                            hasWarned = 1;
                         }
                     }
 
@@ -165,7 +171,6 @@ namespace KuryerBakuBot
             catch (Exception ex)
             {
                 _logger.LogError(ex, "Error in ProcessMediaMessageAsync for User {UserId} in Chat {ChatId}", userId, chatId);
-                // In case of database error, we default to allowing the message to prevent breaking the group
                 return new ModerationResult { IsAllowed = true, ShouldWarn = false };
             }
             finally
@@ -174,7 +179,6 @@ namespace KuryerBakuBot
             }
         }
 
-        // Rollback mechanism: Decrements the user's active media count if an album was deleted
         public async Task DecrementMediaCountAsync(long userId, long chatId, int countToSubtract)
         {
             await _dbLock.WaitAsync();
@@ -183,7 +187,6 @@ namespace KuryerBakuBot
                 using var connection = new SqliteConnection(_connectionString);
                 await connection.OpenAsync();
 
-                // We decrement the count, but ensure it never falls below 0 using SQLite's MAX function
                 string rollbackSql = @"
                     UPDATE UserWindows 
                     SET MediaCount = MAX(0, MediaCount - @SubCount) 
@@ -200,6 +203,94 @@ namespace KuryerBakuBot
             catch (Exception ex)
             {
                 _logger.LogError(ex, "Error rolling back media count for User {UserId} in Chat {ChatId}", userId, chatId);
+            }
+            finally
+            {
+                _dbLock.Release();
+            }
+        }
+
+        public async Task AddPendingDeletionAsync(long chatId, int messageId, DateTime deleteAt)
+        {
+            await _dbLock.WaitAsync();
+            try
+            {
+                using var connection = new SqliteConnection(_connectionString);
+                await connection.OpenAsync();
+
+                string insertSql = @"
+                    INSERT OR REPLACE INTO PendingDeletions (ChatId, MessageId, DeleteAt)
+                    VALUES (@ChatId, @MessageId, @DeleteAt)";
+
+                using var command = new SqliteCommand(insertSql, connection);
+                command.Parameters.AddWithValue("@ChatId", chatId);
+                command.Parameters.AddWithValue("@MessageId", messageId);
+                command.Parameters.AddWithValue("@DeleteAt", deleteAt.ToString("o"));
+
+                await command.ExecuteNonQueryAsync();
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "Failed to log pending deletion for message {MessageId} in chat {ChatId}", messageId, chatId);
+            }
+            finally
+            {
+                _dbLock.Release();
+            }
+        }
+
+        public async Task<List<PendingDeletion>> GetDueDeletionsAsync()
+        {
+            await _dbLock.WaitAsync();
+            var list = new List<PendingDeletion>();
+            try
+            {
+                using var connection = new SqliteConnection(_connectionString);
+                await connection.OpenAsync();
+
+                string selectSql = "SELECT ChatId, MessageId FROM PendingDeletions WHERE DeleteAt <= @Now";
+                using var command = new SqliteCommand(selectSql, connection);
+                command.Parameters.AddWithValue("@Now", DateTime.UtcNow.ToString("o"));
+
+                using var reader = await command.ExecuteReaderAsync();
+                while (await reader.ReadAsync())
+                {
+                    list.Add(new PendingDeletion
+                    {
+                        ChatId = reader.GetInt64(0),
+                        MessageId = reader.GetInt32(1)
+                    });
+                }
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "Failed to retrieve due deletions from database.");
+            }
+            finally
+            {
+                _dbLock.Release();
+            }
+            return list;
+        }
+
+        public async Task RemovePendingDeletionAsync(long chatId, int messageId)
+        {
+            await _dbLock.WaitAsync();
+            try
+            {
+                using var connection = new SqliteConnection(_connectionString);
+                await connection.OpenAsync();
+
+                string deleteSql = "DELETE FROM PendingDeletions WHERE ChatId = @ChatId AND MessageId = @MessageId";
+                using var command = new SqliteCommand(deleteSql, connection);
+                command.Parameters.AddWithValue("@ChatId", chatId);
+                command.Parameters.AddWithValue("@MessageId", messageId);
+
+                await command.ExecuteNonQueryAsync();
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "Failed to clear pending deletion for message {MessageId} in chat {ChatId}", messageId, chatId);
             }
             finally
             {
